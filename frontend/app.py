@@ -23,7 +23,7 @@ div[data-testid="stMetric"] { background:white; border:1px solid #e5e7eb; paddin
 
 API_URL = st.sidebar.text_input(
     "Backend URL",
-    value=st.secrets.get("API_URL", "http://127.0.0.1:8000")
+    value=st.secrets.get("API_URL", "http://127.0.0.1:8000https://your-backend-name.onrender.com")
 ).rstrip("/")
 
 for k,v in {"token":None,"user":None,"resume_id":None,"question":None,"coding":None}.items():
