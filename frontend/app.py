@@ -21,7 +21,10 @@ div[data-testid="stMetric"] { background:white; border:1px solid #e5e7eb; paddin
 </style>
 """, unsafe_allow_html=True)
 
-API_URL = st.sidebar.text_input("Backend URL", value="http://127.0.0.1:8000").rstrip("/")
+API_URL = st.sidebar.text_input(
+    "Backend URL",
+    value=st.secrets.get("API_URL", "http://127.0.0.1:8000")
+).rstrip("/")
 
 for k,v in {"token":None,"user":None,"resume_id":None,"question":None,"coding":None}.items():
     if k not in st.session_state: st.session_state[k]=v
