@@ -1,5 +1,5 @@
 fastapi==0.116.1
-uvicorn[standard]==0.35.0
+uvicorn==0.35.0
 sqlalchemy==2.0.43
 psycopg[binary]==3.2.10
 python-multipart==0.0.20
@@ -9,5 +9,5 @@ pypdf==6.0.0
 python-docx==1.2.0
 reportlab==4.4.3
 requests==2.32.4
-streamlit
-pandas
+streamlit==1.65.0
+pandas==3.0.6
