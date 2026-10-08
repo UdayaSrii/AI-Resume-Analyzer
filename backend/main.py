@@ -63,7 +63,11 @@ from .ai_agent import (
     evaluate_interview_answer,
     generate_coding_question,
     evaluate_code,
-    career_roadmap
+    career_roadmap,
+    write_cv,
+    generate_english_test,
+    evaluate_english_test,
+    english_lesson
 )
 
 from .report_generator import create_report
@@ -1758,6 +1762,101 @@ def jobs_status(user: User = Depends(get_current_user)):
         "configured": bool(os.getenv("ADZUNA_APP_ID") and os.getenv("ADZUNA_APP_KEY")),
         "message": "Live job openings are enabled." if (os.getenv("ADZUNA_APP_ID") and os.getenv("ADZUNA_APP_KEY")) else "Add ADZUNA_APP_ID and ADZUNA_APP_KEY to enable live openings."
     }
+
+
+# ==================================================
+# PROFESSIONAL CV WRITER
+# ==================================================
+
+@app.post("/cv/write")
+def cv_write(
+    resume_id: int = Form(...),
+    target_role: str = Form("Software Engineer"),
+    job_description: str = Form(""),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+    try:
+        result = write_cv(resume.extracted_text, target_role, job_description, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+# ==================================================
+# CV PDF
+# ==================================================
+
+@app.post("/cv/pdf")
+def cv_pdf(
+    cv_content: str = Form(...),
+    filename: str = Form("Professional_CV"),
+    target_role: str = Form("Professional CV"),
+    user: User = Depends(get_current_user),
+):
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", filename).strip("_") or "Professional_CV"
+    pdf_filename = f"{safe_name}.pdf"
+    path = os.path.join(REPORT_DIR, f"{uuid.uuid4()}_{pdf_filename}")
+    try:
+        create_resume_pdf(cv_content, path, target_role or "Professional CV")
+        return FileResponse(path, media_type="application/pdf", filename=pdf_filename)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create CV PDF: {exc}")
+
+
+# ==================================================
+# ENGLISH & COMMUNICATION TEST
+# ==================================================
+
+@app.post("/english/test")
+def english_test(
+    level: str = Form("Intermediate"),
+    focus: str = Form("Mixed English assessment"),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        result = generate_english_test(level, focus, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/english/evaluate")
+def english_evaluate(
+    questions_json: str = Form(...),
+    answers_json: str = Form(...),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        result = evaluate_english_test(questions_json, answers_json, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/english/lesson")
+def english_lesson_route(
+    topic: str = Form(...),
+    level: str = Form("Intermediate"),
+    goal: str = Form("Speak confidently in interviews and workplace conversations"),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        result = english_lesson(topic, level, goal, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ==================================================
