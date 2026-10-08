@@ -1,5 +1,7 @@
 import json
 import os
+import re
+import requests
 import shutil
 import uuid
 
@@ -16,6 +18,13 @@ from fastapi import (
 )
 
 from fastapi.responses import FileResponse
+
+from reportlab.lib.pagesizes import A4
+from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+from reportlab.lib.enums import TA_CENTER
+from reportlab.lib import colors
+from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, PageBreak
+from xml.sax.saxutils import escape
 
 from sqlalchemy.orm import Session
 
@@ -54,7 +63,11 @@ from .ai_agent import (
     evaluate_interview_answer,
     generate_coding_question,
     evaluate_code,
-    career_roadmap
+    career_roadmap,
+    generate_cv,
+    generate_english_test,
+    evaluate_english_test,
+    generate_english_lesson
 )
 
 from .report_generator import create_report
@@ -91,23 +104,167 @@ os.makedirs(
 
 
 # ==================================================
+# HELPERS
+# ==================================================
+
+def _extract_resume_skills(text: str):
+    catalog = [
+        "python", "java", "javascript", "typescript", "c", "c++", "c#",
+        "sql", "mysql", "postgresql", "mongodb", "html", "css", "react",
+        "node.js", "node", "fastapi", "flask", "django", "streamlit",
+        "git", "github", "docker", "aws", "azure", "gcp", "power bi",
+        "tableau", "excel", "pandas", "numpy", "scikit-learn", "tensorflow",
+        "pytorch", "machine learning", "deep learning", "nlp", "generative ai",
+        "langchain", "rest api", "api", "figma", "ui/ux", "testing", "selenium",
+        "playwright", "pytest", "postman", "linux", "firebase"
+    ]
+    low = (text or "").lower()
+    found = []
+    for skill in catalog:
+        if skill in low:
+            found.append(skill)
+    return found
+
+
+def _job_suitability(job: dict, skills: list, fresher_only: bool):
+    title = str(job.get("title", ""))
+    description = str(job.get("description", ""))
+    blob = f"{title} {description}".lower()
+    score = 50
+    matched = []
+    for skill in skills:
+        if skill.lower() in blob:
+            matched.append(skill)
+            score += 4
+    if any(x in blob for x in ["fresher", "graduate", "entry level", "junior", "trainee", "apprentice", "intern"]):
+        score += 12
+    if fresher_only and not any(x in blob for x in ["fresher", "graduate", "entry level", "junior", "trainee", "apprentice", "intern", "0-1 year", "0-2 years"]):
+        score -= 18
+    return max(0, min(100, score)), matched
+
+
+def search_live_jobs(role: str, location: str, resume_text: str, fresher_only: bool = True, limit: int = 15):
+    app_id = os.getenv("ADZUNA_APP_ID", "").strip()
+    app_key = os.getenv("ADZUNA_APP_KEY", "").strip()
+    if not app_id or not app_key:
+        return {
+            "configured": False,
+            "message": "Live job search is not configured. Add ADZUNA_APP_ID and ADZUNA_APP_KEY to the backend environment.",
+            "jobs": [],
+            "source": "Adzuna"
+        }
+
+    role = (role or "Software Engineer").strip()
+    location = (location or "India").strip()
+    skills = _extract_resume_skills(resume_text)
+    query_parts = [role]
+    if fresher_only:
+        query_parts.append("graduate entry level junior fresher")
+    if skills:
+        query_parts.append(" ".join(skills[:5]))
+
+    params = {
+        "app_id": app_id,
+        "app_key": app_key,
+        "results_per_page": min(max(limit * 2, 20), 50),
+        "what": " ".join(query_parts),
+        "where": location,
+        "sort_by": "relevance",
+        "max_days_old": 30,
+        "content-type": "application/json",
+    }
+    try:
+        r = requests.get(
+            "https://api.adzuna.com/v1/api/jobs/in/search/1",
+            params=params,
+            headers={"Accept": "application/json"},
+            timeout=30,
+        )
+        if not r.ok:
+            return {"configured": True, "message": f"Job provider returned HTTP {r.status_code}.", "jobs": [], "source": "Adzuna"}
+        data = r.json()
+    except Exception as exc:
+        return {"configured": True, "message": f"Unable to reach live job provider: {exc}", "jobs": [], "source": "Adzuna"}
+
+    jobs = []
+    seen = set()
+    for raw in data.get("results", []):
+        company = ((raw.get("company") or {}).get("display_name") or "Company")
+        title = raw.get("title") or "Job Opening"
+        url = raw.get("redirect_url") or ""
+        key = f"{company}|{title}|{url}"
+        if key in seen:
+            continue
+        seen.add(key)
+        score, matched = _job_suitability(raw, skills, fresher_only)
+        jobs.append({
+            "id": str(raw.get("id", "")),
+            "title": title,
+            "company": company,
+            "location": ((raw.get("location") or {}).get("display_name") or location),
+            "description": raw.get("description") or "",
+            "url": url,
+            "created": raw.get("created") or "",
+            "salary_min": raw.get("salary_min"),
+            "salary_max": raw.get("salary_max"),
+            "contract_type": raw.get("contract_type") or "",
+            "contract_time": raw.get("contract_time") or "",
+            "suitability_score": score,
+            "matched_skills": matched,
+        })
+
+    jobs.sort(key=lambda x: (x["suitability_score"], x["created"]), reverse=True)
+    return {
+        "configured": True,
+        "source": "Adzuna",
+        "location": location,
+        "role": role,
+        "fresher_friendly_filter": fresher_only,
+        "jobs": jobs[:limit]
+    }
+
+
+def create_resume_pdf(content: str, path: str, title: str = "ATS-Friendly Resume"):
+    styles = getSampleStyleSheet()
+    title_style = ParagraphStyle(
+        "ResumeTitle", parent=styles["Title"], fontSize=18, leading=22,
+        alignment=TA_CENTER, spaceAfter=16, textColor=colors.HexColor("#0f172a")
+    )
+    body_style = ParagraphStyle(
+        "ResumeBody", parent=styles["BodyText"], fontSize=9.5, leading=13,
+        spaceAfter=5, textColor=colors.HexColor("#111827")
+    )
+    heading_style = ParagraphStyle(
+        "ResumeHeading", parent=styles["Heading2"], fontSize=11.5, leading=14,
+        spaceBefore=8, spaceAfter=5, textColor=colors.HexColor("#1d4ed8")
+    )
+    doc = SimpleDocTemplate(path, pagesize=A4, rightMargin=42, leftMargin=42, topMargin=42, bottomMargin=42)
+    story = [Paragraph(escape(title), title_style), Spacer(1, 4)]
+    for raw_line in (content or "").splitlines():
+        line = raw_line.strip()
+        if not line:
+            story.append(Spacer(1, 5))
+            continue
+        clean = re.sub(r"^[#*\-•\d.\s]+", "", line).strip()
+        upper = clean.upper()
+        if (len(clean) < 60 and upper == clean and any(k in upper for k in [
+            "SUMMARY", "PROFILE", "SKILLS", "EXPERIENCE", "INTERNSHIP", "PROJECTS",
+            "EDUCATION", "CERTIFICATIONS", "ACHIEVEMENTS", "LANGUAGES", "COURSEWORK"
+        ])):
+            story.append(Paragraph(escape(clean), heading_style))
+        else:
+            story.append(Paragraph(escape(line).replace("  ", "&nbsp; "), body_style))
+    doc.build(story)
+
+
+# ==================================================
 # APP
 # ==================================================
 
 app = FastAPI(
     title="AI Resume Analyzer & Career Coach",
-    version="3.0.0"
+    version="5.0.0"
 )
-
-
-def normalize_model(provider: str, model_name: str) -> str:
-    legacy = {
-        "llama-3.3-70b-versatile": "openai/gpt-oss-120b",
-        "llama-3.1-8b-instant": "openai/gpt-oss-20b",
-    }
-    if not model_name:
-        return "openai/gpt-oss-120b" if provider.lower() == "groq" else "gpt-4o-mini"
-    return legacy.get(model_name, model_name)
 
 
 # ==================================================
@@ -180,7 +337,7 @@ def root():
         "message":
             "AI Resume Analyzer API is running",
         "version":
-            "3.0.0"
+            "5.0.0"
     }
 
 
@@ -515,7 +672,7 @@ def analyze(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -526,8 +683,6 @@ def analyze(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -741,7 +896,7 @@ def resume_rewrite(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -752,8 +907,6 @@ def resume_rewrite(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -811,7 +964,7 @@ def generate_resume(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -822,8 +975,6 @@ def generate_resume(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -858,6 +1009,100 @@ def generate_resume(
     }
 
 
+
+# ==================================================
+# CV WRITER
+# ==================================================
+
+@app.post("/cv/write")
+def cv_write(
+    resume_id: int = Form(...),
+    target_role: str = Form("Software Engineer"),
+    job_description: str = Form(""),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+    try:
+        result = generate_cv(resume.extracted_text, target_role, job_description, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/cv/pdf")
+def cv_pdf(
+    cv_content: str = Form(...),
+    filename: str = Form("Professional_CV"),
+    target_role: str = Form("Professional CV"),
+    user: User = Depends(get_current_user),
+):
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", filename).strip("_") or "Professional_CV"
+    pdf_filename = f"{safe_name}.pdf"
+    path = os.path.join(REPORT_DIR, f"{uuid.uuid4()}_{pdf_filename}")
+    try:
+        create_resume_pdf(cv_content, path, target_role or "Professional CV")
+        return FileResponse(path, media_type="application/pdf", filename=pdf_filename)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create CV PDF: {exc}")
+
+
+# ==================================================
+# ENGLISH & COMMUNICATION LEARNING
+# ==================================================
+
+@app.post("/english/test")
+def english_test(
+    level: str = Form("Intermediate"),
+    focus: str = Form("Grammar and workplace communication"),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        result = generate_english_test(level, focus, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/english/evaluate")
+def english_evaluate(
+    questions_json: str = Form(...),
+    answers_json: str = Form(...),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        questions = json.loads(questions_json)
+        answers = json.loads(answers_json)
+        result = evaluate_english_test(questions, answers, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+@app.post("/english/lesson")
+def english_lesson(
+    topic: str = Form("Grammar basics"),
+    level: str = Form("Intermediate"),
+    goal: str = Form("Job interviews and workplace communication"),
+    provider: str = Form("Groq"),
+    model_name: str = Form("openai/gpt-oss-120b"),
+    user: User = Depends(get_current_user),
+):
+    try:
+        result = generate_english_lesson(topic, level, goal, provider, model_name)
+        return {"success": True, "result": result}
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
 # ==================================================
 # COVER LETTER
 # ==================================================
@@ -876,7 +1121,7 @@ def cover_letter(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -887,8 +1132,6 @@ def cover_letter(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -941,7 +1184,7 @@ def linkedin(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -952,8 +1195,6 @@ def linkedin(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -1000,7 +1241,7 @@ def job_roles(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -1011,8 +1252,6 @@ def job_roles(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -1059,7 +1298,7 @@ def roadmap(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -1070,8 +1309,6 @@ def roadmap(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -1124,7 +1361,7 @@ def interview_question(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -1135,8 +1372,6 @@ def interview_question(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -1189,7 +1424,7 @@ def interview_evaluate(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     )
 ):
 
@@ -1230,7 +1465,7 @@ def coding_question(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     ),
 
     user: User = Depends(
@@ -1241,8 +1476,6 @@ def coding_question(
         get_db
     )
 ):
-
-    model_name = normalize_model(provider, model_name)
 
     resume = (
         db.query(Resume)
@@ -1295,7 +1528,7 @@ def coding_evaluate(
     provider: str = Form("Groq"),
 
     model_name: str = Form(
-        "openai/gpt-oss-120b"
+        "llama-3.3-70b-versatile"
     )
 ):
 
@@ -1558,6 +1791,56 @@ def report(
         media_type="application/pdf",
         filename=filename
     )
+
+
+# ==================================================
+# DOWNLOADABLE REWRITTEN / GENERATED RESUME PDF
+# ==================================================
+
+@app.post("/resume/pdf")
+def resume_pdf(
+    resume_content: str = Form(...),
+    filename: str = Form("AI_Resume"),
+    target_role: str = Form("ATS-Friendly Resume"),
+    user: User = Depends(get_current_user),
+):
+    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", filename).strip("_") or "AI_Resume"
+    pdf_filename = f"{safe_name}.pdf"
+    path = os.path.join(REPORT_DIR, f"{uuid.uuid4()}_{pdf_filename}")
+    try:
+        create_resume_pdf(resume_content, path, target_role or "ATS-Friendly Resume")
+        return FileResponse(path, media_type="application/pdf", filename=pdf_filename)
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"Could not create resume PDF: {exc}")
+
+
+# ==================================================
+# LIVE JOB OPENINGS FOR FRESHERS
+# ==================================================
+
+@app.post("/jobs/recommend")
+def recommend_jobs(
+    resume_id: int = Form(...),
+    role: str = Form(...),
+    location: str = Form("India"),
+    fresher_only: bool = Form(True),
+    limit: int = Form(15),
+    user: User = Depends(get_current_user),
+    db: Session = Depends(get_db),
+):
+    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
+    if not resume:
+        raise HTTPException(status_code=404, detail="Resume not found.")
+    return search_live_jobs(role, location, resume.extracted_text, fresher_only, max(1, min(limit, 25)))
+
+
+@app.get("/jobs/status")
+def jobs_status(user: User = Depends(get_current_user)):
+    return {
+        "provider": "Adzuna",
+        "configured": bool(os.getenv("ADZUNA_APP_ID") and os.getenv("ADZUNA_APP_KEY")),
+        "message": "Live job openings are enabled." if (os.getenv("ADZUNA_APP_ID") and os.getenv("ADZUNA_APP_KEY")) else "Add ADZUNA_APP_ID and ADZUNA_APP_KEY to enable live openings."
+    }
 
 
 # ==================================================
