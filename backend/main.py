@@ -63,11 +63,7 @@ from .ai_agent import (
     evaluate_interview_answer,
     generate_coding_question,
     evaluate_code,
-    career_roadmap,
-    generate_cv,
-    generate_english_test,
-    evaluate_english_test,
-    generate_english_lesson
+    career_roadmap
 )
 
 from .report_generator import create_report
@@ -263,7 +259,7 @@ def create_resume_pdf(content: str, path: str, title: str = "ATS-Friendly Resume
 
 app = FastAPI(
     title="AI Resume Analyzer & Career Coach",
-    version="5.0.0"
+    version="4.0.0"
 )
 
 
@@ -337,7 +333,22 @@ def root():
         "message":
             "AI Resume Analyzer API is running",
         "version":
-            "5.0.0"
+            "4.0.0"
+    }
+
+
+@app.get("/config/status")
+def config_status():
+    """Safely report whether backend secrets are configured. Never returns secret values."""
+    groq_key = os.getenv("GROQ_API_KEY", "").strip()
+    openai_key = os.getenv("OPENAI_API_KEY", "").strip()
+    adzuna_id = os.getenv("ADZUNA_APP_ID", "").strip()
+    adzuna_key = os.getenv("ADZUNA_APP_KEY", "").strip()
+    return {
+        "groq_configured": bool(groq_key),
+        "openai_configured": bool(openai_key),
+        "adzuna_configured": bool(adzuna_id and adzuna_key),
+        "message": "Backend environment configuration checked successfully."
     }
 
 
@@ -1007,100 +1018,6 @@ def generate_resume(
         "success": True,
         "result": result
     }
-
-
-
-# ==================================================
-# CV WRITER
-# ==================================================
-
-@app.post("/cv/write")
-def cv_write(
-    resume_id: int = Form(...),
-    target_role: str = Form("Software Engineer"),
-    job_description: str = Form(""),
-    provider: str = Form("Groq"),
-    model_name: str = Form("openai/gpt-oss-120b"),
-    user: User = Depends(get_current_user),
-    db: Session = Depends(get_db),
-):
-    resume = db.query(Resume).filter(Resume.id == resume_id, Resume.user_id == user.id).first()
-    if not resume:
-        raise HTTPException(status_code=404, detail="Resume not found.")
-    try:
-        result = generate_cv(resume.extracted_text, target_role, job_description, provider, model_name)
-        return {"success": True, "result": result}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/cv/pdf")
-def cv_pdf(
-    cv_content: str = Form(...),
-    filename: str = Form("Professional_CV"),
-    target_role: str = Form("Professional CV"),
-    user: User = Depends(get_current_user),
-):
-    safe_name = re.sub(r"[^A-Za-z0-9_-]+", "_", filename).strip("_") or "Professional_CV"
-    pdf_filename = f"{safe_name}.pdf"
-    path = os.path.join(REPORT_DIR, f"{uuid.uuid4()}_{pdf_filename}")
-    try:
-        create_resume_pdf(cv_content, path, target_role or "Professional CV")
-        return FileResponse(path, media_type="application/pdf", filename=pdf_filename)
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"Could not create CV PDF: {exc}")
-
-
-# ==================================================
-# ENGLISH & COMMUNICATION LEARNING
-# ==================================================
-
-@app.post("/english/test")
-def english_test(
-    level: str = Form("Intermediate"),
-    focus: str = Form("Grammar and workplace communication"),
-    provider: str = Form("Groq"),
-    model_name: str = Form("openai/gpt-oss-120b"),
-    user: User = Depends(get_current_user),
-):
-    try:
-        result = generate_english_test(level, focus, provider, model_name)
-        return {"success": True, "result": result}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/english/evaluate")
-def english_evaluate(
-    questions_json: str = Form(...),
-    answers_json: str = Form(...),
-    provider: str = Form("Groq"),
-    model_name: str = Form("openai/gpt-oss-120b"),
-    user: User = Depends(get_current_user),
-):
-    try:
-        questions = json.loads(questions_json)
-        answers = json.loads(answers_json)
-        result = evaluate_english_test(questions, answers, provider, model_name)
-        return {"success": True, "result": result}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
-
-
-@app.post("/english/lesson")
-def english_lesson(
-    topic: str = Form("Grammar basics"),
-    level: str = Form("Intermediate"),
-    goal: str = Form("Job interviews and workplace communication"),
-    provider: str = Form("Groq"),
-    model_name: str = Form("openai/gpt-oss-120b"),
-    user: User = Depends(get_current_user),
-):
-    try:
-        result = generate_english_lesson(topic, level, goal, provider, model_name)
-        return {"success": True, "result": result}
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=str(exc))
 
 
 # ==================================================
